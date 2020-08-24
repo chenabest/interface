@@ -1,0 +1,2663 @@
+import os
+import random
+import re
+import time
+from copy import deepcopy
+from datetime import datetime, timedelta
+from io import BytesIO
+from json.decoder import JSONDecodeError
+
+import requests
+from requests.exceptions import SSLError
+from urllib3.exceptions import MaxRetryError
+from PIL import Image
+
+from utils import generate_redis_connect, ABUYUN_PROXIES
+from utils.slack_robot import send_slack
+from appium_robot.robot.wechat.send_message import send_message
+
+"""
+NOTICE: 平台接口类请继承PlatformBasic, 重写此类的方法
+"""
+
+
+class InsufficientAccountException(Exception):
+    """
+    账号不足异常
+    """
+    pass
+
+
+class InsufficientBalanceException(Exception):
+    """
+    余额不足异常，用于在余额不足时结束程序
+    """
+    pass
+
+
+class CodePlatformBasicConfig(object):
+    """所有接码平台通用配置"""
+
+    user_pwd = {'yima': {'user': '1061555353112500', 'password': '1061522525255112500'},
+                }
+
+    platform_hosts = {'yima': 'http://i.fxhyd.cn:8080/UserInterface.aspx',
+                      }
+
+
+class ResponseManager(object):
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_13_6) AppleWebKit/537.36 '
+                      '(KHTML, like Gecko) Chrome/74.0.3729.169 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/a'
+                  'png,*/*;q=0.8,application/signed-exchange;v=b3'
+        # 'Referer': 'http://www.duomi01.com/tutorial/',
+        # Host': 'api.lianxins.com'
+    }
+
+    @staticmethod
+    def string_response_manager(response):
+        """
+        处理字符串类型响应
+        :param response:
+        :return:
+        """
+        if '|' in response.text:
+            status = response.text.split("|")[0]
+            context = response.text.split("|")[1]
+        else:
+            print(response.text)
+            return
+        if status == "0":
+            if '余额不足' in context:
+                print('接码平台余额不足')
+                send_slack('czhao', message='接码平台余额不足', token='czhao')
+                raise InsufficientBalanceException('接码平台余额不足')
+            print("ERROR: %s" % context)
+            return
+        else:
+            return context
+
+    @staticmethod
+    def json_response_manager(url, params, *args, **kwargs):
+        """
+        发起请求，并剔除错误响应
+        :param url: url
+        :param params: 参数
+        :return:
+        """
+        response = requests.get(url, params=params)
+        try:
+            json_response = response.json()
+        except JSONDecodeError as e:
+            print('当前响应{}不支持json: {}'.format(response.text, e))
+            return
+        if not json_response.get('errno', 1):
+            # 成功返回0,失败大于0
+            return json_response
+        else:
+            print('[ERROR] {}'.format(json_response['errmsg']))
+
+
+class PlatformBasic(CodePlatformBasicConfig, ResponseManager):
+    """
+    平台接口类请继承此类
+    """
+
+    def __init__(self, project, platform):
+        self.platform = platform
+        self.pro_name = project
+        assert getattr(self, 'project_nos', None), "请在平台配置类配置项目编号字典project_nos"
+        # import ipdb
+        # ipdb.set_trace()
+        assert self.project_nos.get(project), f"""
+        请传入{platform}平台支持项目名: {self.project_nos.keys()}
+        """
+        self.sid = self.project_nos[project]  # 项目id
+
+    def get_phone(self, phone=None, excludeno=list()):
+        """
+        获取手机号
+        :param phone: 手机号
+        :param excludeno: 排除号段
+        :return:
+        """
+        raise NotImplementedError
+
+    def get_phone_code(self, phone):
+        """
+        获取验证码
+        :param: phone: 手机号
+        :return:
+        """
+        raise NotImplementedError
+
+    def send_sms(self, phone, code, deliver_no=None):
+        """
+        发送短信
+        :param phone: 手机号
+        :param code: 短信
+        :param deliver_no: 解锁号码（收短信的号码）, 并非所有平台支持此参数
+        :return:
+        """
+        raise NotImplementedError
+
+    def get_send_sms_state(self, phone):
+        """
+        获取短信发送状态
+        :param phone: 手机号
+        :return:
+        """
+        raise NotImplementedError
+
+    def release_phone(self, phone=None):
+        """
+        释放手机号
+        :param phone: 手机号, phone为空则释放所有手机号
+        :return:
+        """
+        raise NotImplementedError
+
+    def add_blacklist(self, phone):
+        """
+        加入黑名单
+        :param phone: 手机号
+        :return:
+        """
+        raise NotImplementedError
+
+
+class LianxinPlatformConfig(object):
+    """
+    联信平台配置
+    """
+    # 项目名：项目编号
+    project_nos = {
+        "douban_register": 15773,
+        "58": 14909,
+        # "douban_unlock": 18115,
+        "douban_unlock": 12118,
+
+    }
+
+
+class LianxinPlatform(LianxinPlatformConfig, PlatformBasic):
+    """
+    联信接码平台
+    """
+
+    def __init__(self, project):
+        """
+        :param project: 项目名
+        """
+        platform = 'lianxin'
+        self.host = self.platform_hosts[platform]
+        super(LianxinPlatform, self).__init__(project, platform)
+        self.token = self.get_token()
+
+    def get_token(self):
+        user = self.user_pwd[self.platform]['user']
+        password = self.user_pwd[self.platform]['password']
+
+        params = (
+            ("action", "loginIn"),
+            ("name", user),
+            ("password", password)
+        )
+        response = requests.post(self.host, headers=self.headers, params=params)
+        token = self.string_response_manager(response)
+        return token
+
+    def get_phone(self, phone=None, excludeno=list()):
+        """
+        获取接码平台电话号码
+        易码平台可以指定省市，此功能暂时没有用到
+        :return:
+        """
+        excludeno = excludeno if excludeno else '.'.join(excludeno)
+        params = {
+            'token': self.token,
+            'excludeno': excludeno,
+            'sid': self.sid,
+            'action': phone
+        }
+        if phone:
+            params['phone'] = phone
+        response = requests.get(self.host, headers=self.headers, params=params)
+        account = self.string_response_manager(response)
+        return account
+
+    def get_phone_code(self, phone):
+        """
+        获取验证码
+        :param: phone: 手机号
+        :return:
+        """
+        retry_count = 0
+        retry_limit = random.randint(10, 20)
+
+        params = {
+            "action": "getMessage",
+            "token": self.token,
+            "phone": phone,
+            "sid": self.sid,
+        }
+        if phone:
+            params['phone'] = phone
+
+        while retry_count < retry_limit:
+            try:
+                response = requests.get(self.host, headers=self.headers, params=params)
+            except ConnectionError:
+                retry_count += 1
+                time.sleep(3)
+                continue
+            content = self.string_response_manager(response)
+            if content:
+                pat = "\D([0-9]{4,6})\D"  # 验证码为4-6位置, 增加\D排除11位手机号
+                match_obj = re.search(pat, content)
+                if match_obj:
+                    return match_obj.group(1)
+            time.sleep(3)
+            retry_count += 1
+
+    def send_sms(self, phone, code, deliver_no=None):
+        """
+        发送短信
+        :param phone: 手机号
+        :param code: 短信
+        :param deliver_no: 解锁号码，易码不能指定，多米/联信可以指定
+        :return:
+        """
+        retrys = 0
+        while retrys < 4:
+            params = {"action": "putSentMessage",
+                      "phone": phone,
+                      "sid": self.sid,
+                      "message": code,
+                      "token": self.token,
+                      "author": 'yxrind1',
+                      "recvPhone": deliver_no, }
+            response = requests.get(self.host, headers=self.headers, params=params)
+            status = self.string_response_manager(response)
+            if not status:
+                time.sleep(2)
+                retrys += 1
+            return status
+
+    def get_send_sms_state(self, phone):
+        check_retrys = 0
+        while check_retrys <= 20:
+            params = {"action": "getSentMessageStatus",
+                      "phone": phone,
+                      "sid": self.sid,
+                      "token": self.token}
+            response = requests.get(self.host, headers=self.headers, params=params)
+            status = self.string_response_manager(response)
+            if not status:
+                time.sleep(3)
+                check_retrys += 1
+                continue
+            return status
+
+    def release_phone(self, phone=None, release_all=False):
+        """
+        释放手机号码
+        :param: phone:手机号
+        :param:release_all: 是否释放所有， 易码没有释放所有的接口
+        :return:
+        """
+        if release_all:
+            params = {"action": "cancelAllRecv",
+                      "token": self.token}
+        else:
+            params = {
+                "action": "cancelRecv",
+                "sid": self.sid,
+                "token": self.token,
+                "phone": phone}
+        response = requests.get(self.host, headers=self.headers, params=params)
+        status = self.string_response_manager(response)
+        return status
+
+    def add_blacklist(self, phone):
+        """
+        加入黑名单
+        :param phone
+        :return:
+        """
+
+        params = {
+            "action": "cancelRecv",
+            "sid": self.sid,
+            "token": self.token,
+            "pone": phone}
+        response = requests.get(self.host, headers=self.headers, params=params)
+        status = self.string_response_manager(response)
+        return status
+
+
+class YimaPlatformConfig(object):
+    """
+    易码配置
+    """
+    # 易码平台TOKEN
+    YMTOKEN = "01316976f6808008cd4f1761997fd106d7586bfdd601"
+
+    project_nos = {
+        "douban_register": "289",  # 豆瓣接收短信
+        "douban_unlock": "50059",  # 豆瓣解锁发送短信
+        "douban_unlock_to_0001": "35358",
+        "douban_unlock_to_9527": "6184",
+        "douban_unlock_to_2146": "47768",
+        "tongcheng": "159",
+        "weibo": '1440',  # 微博web注册，发短信0166
+        "weibo_web_sms_login": "35",
+        "weibo_app_sms_login": "11698"
+    }
+
+    YM_STATUS_CODE = {
+        '1001': '参数token不能为空',
+        '1002': '参数action不能为空',
+        '1003': '参数action错误',
+        '1004': 'token失效',
+        '1005': '用户名或密码错误',
+        '1006	用户名不能为空': '',
+        '1007': '密码不能为空',
+        '1008': '账户余额不足',
+        '1009': '账户被禁用',
+        '1010	参数错误': '',
+        '1011	账户待审核': '',
+        '1012': '账户暂停使用',
+        '1013	接口功能未开启': '',
+        '1014	接口登录未开启': '',
+        '2001	参数itemid不能为空': '',
+        '2002': '项目不存在',
+        '2003': '项目未启用',
+        '2004': '暂时没有可用的号码',
+        '2005': '获取号码数量已达到上限',
+        '2006': '参数mobile不能为空',
+        '2007': '号码已被释放',
+        '2008': '号码已离线',
+        '2009': '发送内容不能为空',
+        '2010': '号码正在使用中',
+        '3001': '尚未收到短信',
+        '3002': '等待发送',
+        '3003': '正在发送',
+        '3004': '发送失败',
+        '3005': '订单不存在',
+        '9001': '系统错误',
+        '9002': '系统异常'}
+
+
+class YimaPlatform(YimaPlatformConfig, PlatformBasic):
+    def __init__(self, project):
+        """
+        :param project: 项目名
+        """
+        platform = 'yima'
+        self.host = self.platform_hosts[platform]
+        super(YimaPlatform, self).__init__(project, platform)
+        self.token = "01316976f6808008cd4f1761997fd106d7586bfdd601"
+
+    def get_phone(self, phone=None, excludeno=list(), **kwargs):
+        """
+        获取接码平台电话号码
+        易码平台可以指定省市，此功能暂时没有用到
+        :return:
+        """
+        excludeno = excludeno if excludeno else '.'.join(excludeno)
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        params = {
+            'token': self.token,
+            'excludeno': excludeno,
+            'action': 'getmobile',
+            'itemid': self.sid,
+            'timestamp': timestamp
+        }
+        if phone:
+            params['mobile'] = phone
+        response = requests.get(self.host, headers=self.headers, params=params)
+        account = self.string_response_manager(response)
+        return account
+
+    def get_phone_code(self, phone, retry_limit=None):
+        """
+        获取验证码
+        :param: phone: 手机号
+        :param: retry_limit: 最大重试次数
+        :return:
+        """
+        retry_count = 0
+        retry_limit = retry_limit or random.randint(10, 20)
+        params = {
+            "token": self.token,
+            "phone": phone,
+            "itemid": self.sid,
+            "action": "getsms",
+            "release": "1",
+        }
+        if phone:
+            params['mobile'] = phone
+
+        while retry_count < retry_limit:
+            if self.platform == 'yima':
+                timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+                params["timestamp"] = timestamp
+            try:
+                response = requests.get(self.host, headers=self.headers, params=params)
+            except ConnectionError:
+                retry_count += 1
+                time.sleep(3)
+                continue
+            content = self.string_response_manager(response)
+            if content:
+                pat = "\D([0-9]{4,6})\D"  # 验证码为4-6位置, 增加\D排除11位手机号
+                match_obj = re.search(pat, content)
+                if match_obj:
+                    return match_obj.group(1)
+            time.sleep(3)
+            retry_count += 1
+
+    def send_sms(self, phone, code, deliver_no=None, retry_limit=6):
+        """
+        发送短信
+        :param phone: 手机号
+        :param code: 短信
+        :param deliver_no: 解锁号码，易码不能指定，多米/联信可以指定
+        :param retry_limit: 最大重试次数
+        :return:
+        """
+        retrys = 0
+        while retrys < retry_limit:
+            params = {'action': 'sendsms',
+                      'token': self.token,
+                      'itemid': self.sid,
+                      'mobile': 'phone',
+                      'sms': code}
+            response = requests.get(self.host, headers=self.headers, params=params)
+            status = self.string_response_manager(response)
+            if not status:
+                time.sleep(2)
+                retrys += 1
+            return status
+
+    def get_send_sms_state(self, phone, retry_limit=20):
+        """
+        获取短信发送状态
+        :param phone: 手机号
+        :param retry_limit: 最大重试次数
+        :return:
+        """
+        check_retrys = 0
+        while check_retrys <= retry_limit:
+            timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+            params = {'action': 'getsendsmsstate',
+                      'token': self.token,
+                      'itemid': self.sid,
+                      'mobile': phone,
+                      'timestamp': timestamp
+                      }
+            response = requests.get(self.host, headers=self.headers, params=params)
+            status = self.string_response_manager(response)
+            if not status:
+                time.sleep(3)
+                check_retrys += 1
+                continue
+            return status
+
+    def release_phone(self, phone=None, release_all=False):
+        """
+        释放手机号码
+        :param: phone:手机号
+        :param:release_all: 是否释放所有， 易码没有释放所有的接口
+        :return:
+        """
+        params = {'action': 'release',
+                  'token': self.token,
+                  'itemid': self.sid,
+                  'mobile': phone}
+
+        response = requests.get(self.host, headers=self.headers, params=params)
+        status = self.string_response_manager(response)
+        return status
+
+    def add_blacklist(self, phone):
+        """
+        加入黑名单
+        :param phone
+        :return:
+        """
+        params = {'action': 'addignore',
+                  'token': self.token,
+                  'itemid': self.sid,
+                  "mobile": phone}
+
+        response = requests.get(self.host, headers=self.headers, params=params)
+        status = self.string_response_manager(response)
+        return status
+
+
+class DuomiPlatformConfig(object):
+    """
+    多米配置
+    """
+    project_nos = {
+        "weibo_register": 16393,
+        "weibo": 15854,
+        "beike_register": 10412,
+        "douban_register": 11102,
+        "douban_unlock": 16886,
+        "58": 11265,
+        'boss': 13957,
+        "shixiseng": 10418
+    }
+
+
+class DuomiPlatform(DuomiPlatformConfig, PlatformBasic):
+    """
+    多米接码平台
+    """
+
+    def __init__(self, project):
+        """
+        :param project: 项目名
+        """
+        platform = 'duomi'
+        self.host = self.platform_hosts[platform]
+        super(DuomiPlatform, self).__init__(project, platform)
+        self.token = self.get_token()
+
+    def get_token(self):
+        user = self.user_pwd[self.platform]['user']
+        password = self.user_pwd[self.platform]['password']
+        params = (
+            ("action", "loginIn"),
+            ("name", user),
+            ("password", password)
+        )
+        response = requests.post(self.host, headers=self.headers, params=params)
+        token = self.string_response_manager(response)
+        return token
+
+    def get_phone(self, phone=None, excludeno=list()):
+        """
+        获取接码平台电话号码
+        :return:
+        """
+        excludeno = excludeno if excludeno else '.'.join(excludeno)
+        params = {
+            'token': self.token,
+            'excludeno': excludeno,
+            'sid': self.sid,
+            'action': 'getPhone'
+        }
+        if phone:
+            params['phone'] = phone
+
+        response = requests.get(self.host, headers=self.headers, params=params)
+        account = self.string_response_manager(response)
+        return account
+
+    def get_phone_code(self, phone):
+        """
+        获取验证码
+        :param: phone: 手机号
+        :return:
+        """
+        retry_count = 0
+        retry_limit = random.randint(10, 20)
+
+        params = {
+            "action": "getMessage",
+            "token": self.token,
+            "phone": phone,
+            "sid": self.sid,
+        }
+        if phone:
+            params['phone'] = phone
+
+        while retry_count < retry_limit:
+            try:
+                response = requests.get(self.host, headers=self.headers, params=params)
+            except ConnectionError:
+                retry_count += 1
+                time.sleep(3)
+                continue
+            content = self.string_response_manager(response)
+            if content:
+                pat = "\D([0-9]{4,6})\D"  # 验证码为4-6位置, 增加\D排除11位手机号
+                match_obj = re.search(pat, content)
+                if match_obj:
+                    return match_obj.group(1)
+            time.sleep(3)
+            retry_count += 1
+
+    def send_sms(self, phone, code, deliver_no=None):
+        """
+        发送短信
+        :param phone: 手机号
+        :param code: 短信
+        :param deliver_no: 解锁号码，易码不能指定，多米/联信可以指定
+        :return:
+        """
+        retrys = 0
+        while retrys < 4:
+            params = {"action": "putSentMessage",
+                      "phone": phone,
+                      "sid": self.sid,
+                      "message": code,
+                      "token": self.token,
+                      "author": 'yxrind1',
+                      "recvPhone": deliver_no}
+            response = requests.get(self.host, headers=self.headers, params=params)
+            status = self.string_response_manager(response)
+            if not status:
+                time.sleep(2)
+                retrys += 1
+            return status
+
+    def get_send_sms_state(self, phone):
+        check_retrys = 0
+        while check_retrys <= 20:
+            params = {"action": "getSentMessageStatus",
+                      "phone": phone,
+                      "sid": self.sid,
+                      "token": self.token}
+            response = requests.get(self.host, headers=self.headers, params=params)
+            status = self.string_response_manager(response)
+            if not status:
+                time.sleep(3)
+                check_retrys += 1
+                continue
+            return status
+
+    def release_phone(self, phone=None):
+        """
+        释放手机号码
+        :param: phone:手机号
+        :param:release_all: 是否释放所有， 易码没有释放所有的接口
+        :return:
+        """
+        if not phone:
+            params = {"action": "cancelAllRecv",
+                      "token": self.token}
+        else:
+            params = {
+                "action": "cancelRecv",
+                "sid": self.sid,
+                "token": self.token,
+                "phone": phone}
+        response = requests.get(self.host, headers=self.headers, params=params)
+        status = self.string_response_manager(response)
+        return status
+
+    def add_blacklist(self, phone):
+        """
+        加入黑名单
+        :param phone
+        :return:
+        """
+        params = {
+            "action": "addBlacklist",
+            "sid": self.sid,
+            "token": self.token,
+            "pone": phone}
+        response = requests.get(self.host, headers=self.headers, params=params)
+        status = self.string_response_manager(response)
+        return status
+
+
+class WolfPlatformConfig(object):
+    """
+    wolf平台配置
+    """
+    # 项目名，项目编号对应字典
+    project_nos = {
+        "douban_unlock": '6462',
+        "douban_unlock_to_0001": "1931",
+        "douban_unlock_to_2146": "6573",
+        "douban_unlock_to_9527": "7528",
+        "douban_unlock_to_9257": "7398",
+        "douban_register": "882",
+        "weibo_register": "7731",
+        "weibo_register_by_1086": "1086",
+        "beike_register": "4169",
+        "maimai": "1292"
+    }
+
+
+class WolfCodePlatform(WolfPlatformConfig, PlatformBasic):
+    """
+    NOTICE:调用接口时请不要传入token，因为token_wrapper会自动传入token
+    """
+    redis_db7 = generate_redis_connect('localhost:6379/7')
+    port_redis_key = 'wolf_phone_ports'  # hash {phone, port}
+
+    def __init__(self, project):
+        platform = 'wolf'
+        super(WolfCodePlatform, self).__init__(project, platform)
+        token = self.redis_db7.get('wolf_token')
+        if token:
+            self.token = token
+        else:
+            self.token = self.get_token()
+
+    def get_token(self):
+        url = 'http://api.yyyzmpt.com/index.php/reg/login'
+        user = self.user_pwd[self.platform]['user']
+        password = self.user_pwd[self.platform]['password']
+        params = {'username': user, 'password': password}
+        json_response = self.json_response_manager(url, params)
+        token = json_response['ret']['token']
+        self.token = token
+        self.redis_db7.set('wolf_token', token)
+        self.redis_db7.expire('wolf_token', timedelta(minutes=10))
+        return token or None
+
+    def login_out(self):
+        url = 'http://api.yyyzmpt.com/index.php/reg/tokenOut'
+        # 初次登录没有token
+        if not self.token:
+            return
+        params = {'token': self.token}
+        json_response = self.json_response_manager(url, params)
+        return json_response
+
+    @classmethod
+    def refresh_token(cls):
+        """
+        token延时600秒, 设置为类方法，避免airflow调度时刷新token
+        :return:
+        """
+        url = 'http://api.yyyzmpt.com/index.php/token'
+        token = cls.redis_db7.get('wolf_token')
+        if token:
+            cls.redis_db7.expire('wolf_token', timedelta(minutes=9))
+            params = {'token': token}
+            json_response = cls.json_response_manager(url, params)
+            return bool(json_response)
+        else:
+            print('当前没有token')
+
+    def get_phone(self, phone=None, excludeno=list(), specify_no=None):
+        """
+        获取手机号
+        :param phone: 手机号
+        :param excludeno: 排除号段，wolf最多支持5个号段
+        :param specify_no: 指定号段 7位
+        :return:
+        """
+        # 释放其他账号, wolf豆瓣项目有限制，最多只能同时使用5个号豆瓣手机号
+        self.release_phone()
+        url = 'http://api.yyyzmpt.com/index.php/clients/online/setWork'
+        if phone:
+            params = {'token': self.token,
+                      't': 3,  # 3表示指定手机号
+                      'pid': self.sid,
+                      'number': phone,
+                      }
+        elif specify_no:
+            params = {'token': self.token,
+                      't': 4,  # 4表示指定号段
+                      'pid': self.sid,
+                      'number': phone,
+                      'ascription': specify_no
+                      }
+        else:
+            params = {'token': self.token,
+                      't': 1,  # 4表示指定号段
+                      'pid': self.sid,
+                      'ascription': 1  # 取实卡号段
+                      }
+
+        if excludeno:
+            # wolf最多支持排除5个号段, 这里使用类型4，直接指定号段
+            params['paichu'] = ','.join(excludeno)
+        json_response = self.json_response_manager(url, params)
+        # 返回手机号和端口号
+        # 存储端口号，共解锁时使用
+        if not json_response:
+            return None
+        port = json_response['ret']['com_n']
+        phone = json_response['ret']['number']
+        self.redis_db7.hset(self.port_redis_key, phone, port)
+        return phone
+
+    def get_phone_code(self, phone, retry_limit=None):
+        """
+        获取短信
+        :param phone: 手机号
+        :param retry_limit: 最大重试次数
+        :return:
+        """
+        url = 'http://api.yyyzmpt.com/index.php/clients/sms/getSms'
+        params = {'token': self.token,
+                  'project': self.sid,
+                  'number': phone,
+                  'type': '1',
+                  }
+        retry_count = 0
+        retry_limit = retry_limit or random.randint(15, 20)
+        while retry_count < retry_limit:
+            try:
+                json_response = self.json_response_manager(url, params)
+            except ConnectionError:
+                retry_count += 1
+                time.sleep(3)
+                continue
+            if json_response:
+                break
+
+            time.sleep(3)
+            retry_count += 1
+        else:
+            json_response = self.json_response_manager(url, params)
+
+        if json_response:
+            sms = json_response['ret']['tst']
+            pattern = "\D([0-9]{4,6})\D"  # 验证码为4-6位, 增加\D排除11位手机号
+            match_obj = re.search(pattern, sms)
+            if match_obj:
+                return match_obj.group(1)
+            time.sleep(3)
+            retry_count += 1
+            return json_response['ret']['tst']
+
+    def get_send_sms_state(self, phone, retry_limit=None):
+        """
+        获取短信发送状态
+        :param phone: 手机号
+        :param retry_limit: 最大重试次数
+        :return:
+        """
+        url = 'http://api.yyyzmpt.com/index.php/clients/sms/getSms'
+        params = {'token': self.token,
+                  'project': self.sid,
+                  'number': phone,
+                  'type': '2',
+                  }
+        retry_count = 0
+        retry_limit = retry_limit or random.randint(15, 20)
+        while retry_count < retry_limit:
+            try:
+                json_response = self.json_response_manager(url, params)
+            except ConnectionError:
+                retry_count += 1
+                time.sleep(3)
+                continue
+            if json_response:
+                break
+
+            time.sleep(3)
+            retry_count += 1
+        else:
+            json_response = self.json_response_manager(url, params)
+        return bool(json_response)
+
+    def send_sms(self, phone, code, retry_limit=4, *args, **kwargs):
+        """
+        发送短信
+        :param phone: 手机号
+        :param code: 要发送验证码
+        :param retry_limit: 最大重试次数
+        :return:
+        """
+        phone_port = self.redis_db7.hget(self.port_redis_key, phone)
+
+        url = 'http://api.yyyzmpt.com/index.php/clients/sms/uploadSms'
+        params = {'token': self.token,
+                  'pid': self.sid,
+                  'number': phone,
+                  'com_n': phone_port,
+                  'tst': code}
+        for retry in range(retry_limit):
+            json_response = self.json_response_manager(url, params)
+            print('发送短信的响应', json_response)
+            if json_response:
+                return True
+            time.sleep(2)
+
+    def release_phone(self, phone=None):
+        url = 'http://api.yyyzmpt.com/index.php/clients/online/completeWork'
+        params = {'token': self.token}
+        if phone:
+            params['number'] = phone
+        json_response = self.json_response_manager(url, params)
+        return bool(json_response)
+
+    def add_blacklist(self, phone):
+        url = 'http://api.yyyzmpt.com/index.php/clients/user/blackno'
+        params = {'token': self.token,
+                  'number': phone,
+                  'pid': self.sid}
+
+        json_response = self.json_response_manager(url, params=params)
+        return bool(json_response)
+
+
+class LaixinPlatform(PlatformBasic):
+    """
+    来信接码平台
+    """
+    project_nos = {
+        "58": 19655,
+        "weibo_register": 1327,
+        "woaiwojia": 4367,
+        "baletu": 3401,
+        "lianjia": 2198,
+        "maimai": 2077,
+        "douban": 1170,
+        "fangtianxia": 1165,
+        "renren": 1120,
+        "beike_register": 1033
+    }
+
+    def __init__(self, project):
+        """
+        :param project: 平台名
+        """
+        platform = 'laixin'
+        self.host = self.platform_hosts[platform]
+        super(LaixinPlatform, self).__init__(project, platform)
+        self.token = self.get_token()
+
+    def get_token(self):
+        user = self.user_pwd[self.platform]['user']
+        password = self.user_pwd[self.platform]['password']
+        params = (
+            ("action", "loginIn"),
+            ("name", user),
+            ("password", password)
+        )
+        response = requests.post(self.host, headers=self.headers, params=params)
+        token = self.string_response_manager(response)
+        return token
+
+    def get_phone(self, phone=None, excludeno=list(), *args, **kwargs):
+        """
+        获取接码平台电话号码，不支持指定号段
+        :return:
+        """
+
+        params = {
+            'token': self.token,
+            'sid': self.sid,
+            'action': 'getPhone',
+            'vno': 0  # 排除虚拟运营商
+        }
+        if phone:
+            params['phone'] = phone
+
+        response = requests.get(self.host, headers=self.headers, params=params)
+        account = self.string_response_manager(response)
+        return account
+
+    def get_phone_code(self, phone, retry_limit=None):
+        """
+        获取验证码
+        :param: phone: 手机号
+        :param: retry_limit: 重试次数
+        :return:
+        """
+        retry_count = 0
+        retry_limit = retry_limit or random.randint(10, 20)
+
+        params = {
+            "action": "getMessage",
+            "token": self.token,
+            "phone": phone,
+            "sid": self.sid,
+            "author": 'yxrind'
+        }
+        if phone:
+            params['phone'] = phone
+
+        while retry_count < retry_limit:
+            try:
+                response = requests.get(self.host, headers=self.headers, params=params)
+            except ConnectionError:
+                retry_count += 1
+                time.sleep(3)
+                continue
+            content = self.string_response_manager(response)
+            if content:
+                pat = "\D([0-9]{4,6})\D"  # 验证码为4-6位置, 增加\D排除11位手机号
+                match_obj = re.search(pat, content)
+                if match_obj:
+                    return match_obj.group(1)
+            time.sleep(3)
+            retry_count += 1
+
+    def send_sms(self, *args, **kwargs):
+        """
+        来信接码平台不支持发送短信
+        :param args:
+        :param kwargs:
+        :return:
+        """
+        raise Exception('来信接码平台不支持发短信')
+
+    def get_send_sms_state(self, *args, **kwargs):
+        """
+        来信接码平台不支持发送短信
+        :param args:
+        :param kwargs:
+        :return:
+        """
+        raise Exception('来信接码平台不支持发短信')
+
+    def release_phone(self, phone=None):
+        """
+        释放手机号码
+        :param: phone:手机号
+        :param:release_all: 是否释放所有， 易码没有释放所有的接口
+        :return:
+        """
+        if not phone:
+            params = {"action": "cancelAllRecv",
+                      "token": self.token,
+                      }
+        else:
+            params = {
+                "action": "cancelRecv",
+                "sid": self.sid,
+                "token": self.token,
+                "phone": phone}
+        response = requests.get(self.host, headers=self.headers, params=params)
+        status = self.string_response_manager(response)
+        return status
+
+    def add_blacklist(self, phone):
+        """
+        加入黑名单
+        :param phone
+        :return:
+        """
+        params = {
+            "action": "addBlacklist",
+            "sid": self.sid,
+            "token": self.token,
+            "phone": phone}
+        response = requests.get(self.host, headers=self.headers, params=params)
+        status = self.string_response_manager(response)
+        return status
+
+    def get_balance(self):
+        """
+        获取当前用户账户余额
+        来信建议间隔1分钟
+        :return: str: 余额
+        """
+        params = {'action': 'getSummary',
+                  "token": self.token,
+                  }
+        response = requests.get(self.host, headers=self.headers, params=params)
+        balance = self.string_response_manager(response)
+        return balance
+
+
+class HaiTunAiShangBase(PlatformBasic):
+    """
+    海豚/爱尚接口的基类，两平台接口除了域名，获取手机号接口之外，完全相同
+    """
+    redis_db7 = generate_redis_connect('localhost:6379/7')
+
+    def __init__(self, project, platform):
+        """
+        :param project: 项目名
+        :param platform: 平台名
+        """
+        self.host = self.platform_hosts[platform]
+        super(HaiTunAiShangBase, self).__init__(project, platform)
+        self.token = self.get_token()
+
+    def get_pid(self, phone):
+        pid = self.redis_db7.hget(self.pid_redis_key, phone)
+        return pid
+
+    def get_token(self):
+        user = self.user_pwd[self.platform]['user']
+        password = self.user_pwd[self.platform]['password']
+        params = {
+            'act': 'login',
+            'ApiName': user,
+            'PassWord': password,
+        }
+        response = requests.get(self.host, params=params)
+        token = self.string_response_manager(response)
+        return token
+
+    def get_balance(self):
+        params = {
+            'act': 'myInfo',
+            'token': self.token
+        }
+        response = requests.get(self.host, params=params)
+        return self.string_response_manager(response)
+
+    def get_phone(self, *args, **kwargs):
+        raise NotImplementedError
+
+    def get_phone_code(self, phone, retry_limit=None):
+        pid = self.get_pid(phone)
+        params = {
+            'act': 'getPhoneCode',
+            'token': self.token,
+            'pid': pid
+        }
+
+        retry_count = 0
+        retry_limit = retry_limit or random.randint(15, 20)
+        while retry_count < retry_limit:
+            try:
+                response = requests.get(self.host, params=params)
+                code = self.string_response_manager(response)
+                if code:
+                    return code
+                retry_count += 1
+                time.sleep(3)
+            except ConnectionError:
+                retry_count += 1
+                time.sleep(3)
+                continue
+
+    def release_phone(self, phone=None):
+        assert phone, '请传入手机号'
+        pid = self.get_pid(phone)
+        params = {
+            'act': 'setRel',
+            'token': self.token,
+            'pid': pid
+        }
+        response = requests.get(self.host, params=params)
+        result = self.string_response_manager(response)
+        return bool(result)
+
+    def add_blacklist(self, pid):
+        params = {
+            'act': 'addBlack',
+            'token': self.token,
+            'pid': pid,
+            'reason': 'used'
+        }
+        response = requests.get(self.host, params=params)
+        result = self.string_response_manager(response)
+        return bool(result)
+
+    def send_sms(self, phone, code, deliver_no=None, retry_limit=4):
+        assert deliver_no, '海豚接码平台必须指定接收号码'
+        pid = self.redis_db7.hget(self.pid_redis_key, phone)
+        params = {'act': 'sendCode',
+                  'token': self.token,
+                  'pid': pid,
+                  'receiver': deliver_no,
+                  'smscontent': code
+                  }
+        for retry in range(retry_limit):
+            response = requests.get(self.host, params=params)
+            result = self.string_response_manager(response)
+            if result:
+                return True
+            time.sleep(2)
+
+    def get_send_sms_state(self, phone, retry_limit=None):
+        pid = self.get_pid(phone)
+        params = {
+            'act': 'getPhoneCode',
+            'token': self.token,
+            'pid': pid
+        }
+
+        retry_count = 0
+        retry_limit = retry_limit or random.randint(15, 20)
+        while retry_count < retry_limit:
+            try:
+                response = requests.get(self.host, params=params)
+                result = self.string_response_manager(response)
+                print('结果', result)
+                if result:
+                    return result
+            except ConnectionError:
+                pass
+            retry_count += 1
+            time.sleep(3)
+
+
+class AiShangPlatform(HaiTunAiShangBase):
+    project_nos = {
+        "58": '1044',
+        "weibo_register": '1056',
+        "woaiwojia": '1124',
+        "douban_register": '1113',
+        "douban_unlock": '1115',
+        "douban_unlock_to_0001": "1143",
+        "beike_register": '1088'
+    }
+    pid_redis_key = 'aishang_phone_pids'
+
+    def __init__(self, project):
+        """
+        :param project: 平台名
+        """
+        platform = 'aishang'
+        super(AiShangPlatform, self).__init__(project, platform)
+
+    def get_phone(self, phone=None, *args, **kwargs):
+        """
+        该平台不支持排除号段
+        :param phone: 指定获取手机号
+        :param args:
+        :param kwargs:
+        :return:
+        """
+        params = {
+            'act': 'getPhone',
+            'token': self.token,
+            'iid': self.sid,
+            'seq': '2'  # 2代表正常号段（非虚拟号段）
+        }
+        if phone:
+            params['mobile'] = phone
+        response = requests.get(self.host, params=params)
+        sms = response.text.split('|')
+        if sms[0] == '1':
+            pid = sms[1]
+            phone = sms[4]
+            self.redis_db7.hset(self.pid_redis_key, phone, pid)
+            return phone
+        else:
+            print('爱尚接码平台账号获取失败 失败代码{}, 项目{},id {}'.format(sms[1], self.pro_name, self.sid))
+            return
+
+
+class HaiTunPlatform(HaiTunAiShangBase):
+    """
+    Notice：海豚豆瓣解锁项目为 1个项目可指定多个号码
+    """
+    project_nos = {
+        "58": '2504',
+        "weibo_register": '2057',
+        "woaiwojia": '2531',
+        "douban_register": '2525',
+        "douban_unlock": '2526',
+        "beike_register": '2486',
+        "maimai": "2439"
+    }
+    pid_redis_key = 'aishang_phone_pids'
+
+    def __init__(self, project):
+        """
+        :param project: 平台名
+        """
+        platform = 'haitun'
+        super(HaiTunPlatform, self).__init__(project, platform)
+
+    def get_phone(self, phone=None, *args, **kwargs):
+        """
+        该平台不支持排除号段
+        :param phone: 指定获取手机号
+        :param args:
+        :param kwargs:
+        :return:
+        """
+        params = {
+            'act': 'getPhone',
+            'token': self.token,
+            'iid': self.sid,
+        }
+        if phone:
+            params['mobile'] = phone
+        response = requests.get(self.host, params=params)
+        sms = response.text.split('|')
+        if sms[0] == '1':
+            pid = sms[1]
+            phone = sms[4]
+            self.redis_db7.hset(self.pid_redis_key, phone, pid)
+            return phone
+        else:
+            print('账号获取失败失败代码{}'.format(sms[1]))
+            return
+
+
+class FeiYuDingChuangDongMaBase(PlatformBasic):
+    """
+    飞鱼/鼎创公用接口
+    """
+
+    def __init__(self, project, platform):
+        """
+        :param project: 平台名
+        :param platform: 接码平台名
+        """
+        self.host = self.platform_hosts[platform]
+        super(FeiYuDingChuangDongMaBase, self).__init__(project, platform)
+        self.token = self.get_token()
+
+    @staticmethod
+    def response_map(response):
+        """
+        本平台错误响应的过滤处理
+        :return:
+        """
+        text = response.text
+        if text == 0 or text.startswith('-') or text.startswith('id='):
+            return ''
+        else:
+            return text
+
+    def get_token(self):
+        user = self.user_pwd[self.platform]['user']
+        password = self.user_pwd[self.platform]['password']
+        url = self.host + '/UserLoginStr'
+        params = {
+            'name': user,
+            'psw': password,
+        }
+        response = requests.get(url, params=params)
+        print(response.text, 'token')
+        token = self.response_map(response)
+        return token
+
+    def _get_specify_phone(self, phone):
+        url = self.host + '/mkHM2Str?pk='
+        params = {'xmid': self.sid,
+                  'token': self.token,
+                  'hm': phone,
+                  'op': 1,  # 0/1 检测/不检测是否已经做过该项目
+                  'rj': 'pinshiyou',
+                  }
+        response = requests.get(url, params=params)
+        if response.text == '1':
+            return phone
+
+    def _get_random_phone(self, specify_no=None):
+        url = self.host + '/GetHM2Str?&a1=&a2=&pk=&ks=0'
+        params = {'xmid': self.sid,
+                  'token': self.token,
+                  'sl': 1,  # 取号数量
+                  'rj': 'pinshiyou',
+                  'lx': specify_no or '6'}  # 6表示取非虚拟号
+
+        # 6表示非虚拟号
+        response = requests.get(url, params=params)
+        print(response.text)
+        phone_text = self.response_map(response)
+        if '=' in phone_text:
+            phone = phone_text.split('=')[-1]
+            return phone
+
+    def get_phone(self, phone=None, specify_no=None, *args, **kwargs):
+        """
+        该平台不支持排除号段
+        :param phone: 指定获取手机号
+        :param specify_no: 指定号段
+        :param args:
+        :param kwargs:
+        :return:
+        """
+        if phone:
+            return self._get_specify_phone(phone)
+        else:
+            return self._get_random_phone()
+
+    def get_phone_code(self, phone, retry_limit=None):
+        url = self.host + '/GetYzm2Str'
+        params = {
+            'token': self.token,
+            'xmid': self.sid,
+            'hm': phone,
+            'sf': 1
+        }
+
+        retry_count = 0
+        retry_limit = retry_limit or random.randint(15, 20)
+        while retry_count < retry_limit:
+            print('【INFO】正在获取验证码 第{}次重试'.format(retry_count))
+            try:
+                response = requests.get(url, params=params)
+                text = response.text
+                print('接收短信的状态', text)
+                if len(text) > 4:
+                    re_match = re.search('(\d{4,6})', text[22:])  # text前21位字符串为接码平台自带时间前缀
+                    if re_match:
+                        code = re_match.group(1)
+                        return code
+                retry_count += 1
+                time.sleep(5)
+            except ConnectionError:
+                retry_count += 1
+                time.sleep(5)
+                continue
+
+    def send_sms(self, phone, code, deliver_no=None, retry_limit=4):
+        url = self.host + '/SendSms3Str?pk=&rj='
+        params = {'token': self.token,
+                  'xmid': self.sid,
+                  'hm': phone,
+                  'nr': code,
+                  'rhm': ''
+                  }
+        if deliver_no:
+            params['rhm'] = deliver_no
+        for retry in range(retry_limit):
+            response = requests.get(url, params=params)
+            if response.text == '1':
+                return True
+            time.sleep(2)
+
+    def get_send_sms_state(self, phone, retry_limit=None):
+        """
+        获取短信发送回执，平台建议间隔6-10秒获取
+        :param phone: 手机号
+        :param retry_limit: 重试次数
+        :return:
+        """
+        url = self.host + '/GetFsState'
+        params = {
+            'token': self.token,
+            'xmid': self.sid,
+            'hm': phone
+        }
+
+        retry_count = 0
+        retry_limit = retry_limit or random.randint(15, 20)
+        while retry_count < retry_limit:
+            try:
+                response = requests.get(url, params=params)
+                text = response.text
+                if text == '发送成功':
+                    return True
+                elif text == '发送失败' or text == '0':
+                    return
+                else:
+                    retry_count += 1
+                    time.sleep(4)
+            except ConnectionError:
+                retry_count += 1
+                time.sleep(4)
+                continue
+
+    def _release_all(self):
+        """
+        释放所有
+        :return:
+        """
+        url = self.host + '/sfAllStr'
+        params = {'token': self.token}
+        response = requests.get(url, params=params)
+        if response.text == '1':
+            return True
+
+    def _release_single(self, phone):
+        """
+        释放单个手机号
+        :param phone:
+        :return:
+        """
+        url = self.host + '/sfHmStr'
+        params = {
+            'hm': phone,
+            'token': self.token}
+        response = requests.get(url, params=params)
+        if response.text == '1':
+            return True
+
+    def release_phone(self, phone=None):
+        """
+        本平台只能单个释放
+        :param phone: 手机号
+        :return:
+        """
+        if phone:
+            return self._release_single(phone)
+        else:
+            return self._release_all()
+
+    def add_blacklist(self, phone):
+        url = self.host + '/Hmd2Str'
+        params = {
+            'token': self.token,
+            'xmid': self.sid,
+            'hm': phone,
+            'sf': 1
+        }
+        response = requests.get(url, params=params)
+        if response.text == '1':
+            return True
+        else:
+            print(response.text)
+
+
+class DingChuangDongMaPlatform(FeiYuDingChuangDongMaBase):
+    """
+    Notice：鼎创豆瓣解锁项目为 1个项目可指定多个号码
+    """
+    project_nos = {
+        'douban_register': '354170',
+        'douban_unlock': '354170'
+    }
+
+    def __init__(self, project):
+        """
+        :param project: 平台名
+        """
+        platform = 'dingchuang'
+        super(DingChuangDongMaPlatform, self).__init__(project, platform)
+
+
+class FeiYuPlatformDongMa(FeiYuDingChuangDongMaBase):
+    """
+    飞鱼接码平台
+    """
+    project_nos = {
+        'douban_register': '354170',
+        'douban_unlock': '354170'
+    }
+
+    def __init__(self, project):
+        """
+        :param project: 平台名
+        """
+        platform = 'feiyu'
+        super(FeiYuPlatformDongMa, self).__init__(project, platform)
+
+
+class DongMa(FeiYuDingChuangDongMaBase):
+    project_nos = {
+        'douban_register': '99',
+        'douban_unlock': '2626',  # 10690295927
+        'douban_unlock_to_0001': '2626',  # 1069003270001
+        'douban_unlock_to_1723': '2677',  # 1069027031723
+        'douban_unlock_to_9527': '2677',  # 106900769527
+        'weibo_register': '22016',
+        "58": '41',
+
+    }
+
+    def __init__(self, project):
+        """
+        :param project: 平台名
+        """
+        platform = 'dongma'
+        super(DongMa, self).__init__(project, platform)
+
+
+class FeiGou(PlatformBasic):
+    """
+    飞狗接码平台
+    """
+    project_nos = {
+        'douban_register': 'e554ecc9aa0046788554394e2901b64d',  # 项目号3489
+        'weibo_register': '9a127d6a379545f9acdb8d8cca3b75eb',
+        'douban_unlock': '66d0d3ff65ac4cfd97e898585579d532',  # 10997 106902959527
+        'douban_unlock_to_0001': '5fa92d094e6a4269a0c0c8edc2213a5b',  # 7053 1069003270001
+        'douban_unlock_to_2146': '9eca89fce25d42f4b2a35d0b9bc2766f',  # 9989 106925592146
+        'douban_unlock_to_9527': '6a383faf627e45ada2e960696113a927',  # 11005 106900769527
+        'douban_unllock_to_9257': 'af6751f8b8f94265852f34a06ff9bba6',  # 10922 # 106902959257
+        '58': 'd4d1cba300b040ceb2b4303d2bc5fa37'  # 4611
+
+    }
+    headers = {'Accept': 'application/json, text/javascript, */*; q=0.01',
+               'Accept-Encoding': 'gzip, deflate',
+               'Accept-Language': 'en-US,en;q=0.9',
+               'Cache-Control': 'no-cache',
+               'Host': '47.244.25.193:9091',
+               'Pragma': 'no-cache',
+               'Referer': 'http://47.244.25.193:9091/admin/login;',
+               'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_4) '
+                             'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/78.0.3904.70 Safari/537.36',
+               'X-Requested-With': 'XMLHttpRequest'
+               }
+
+    cookies = dict()
+
+    def __init__(self, project):
+        platform = 'feigou'
+        self.host = self.platform_hosts[platform]
+        super(FeiGou, self).__init__(project, platform)
+        self.redis_db7 = generate_redis_connect('CZHAOs-iMac:6379/7')
+        self.cookies = self.get_token()
+
+    @staticmethod
+    def _get_session_cookies():
+        """
+        获取会话cookie: jeesite.session.id 和JSESSIONID
+        :return:
+        """
+        url = 'http://47.244.25.193:9091/admin'
+        response = requests.get(url, allow_redirects=False, proxies=ABUYUN_PROXIES)
+        # 提取jeesite.session.id
+        cookies = response.cookies.get_dict()
+        # 提取JSESSIONID
+        location = response.headers.get('Location')
+        jsessionid = location.split('JSESSIONID=')[-1]
+        cookies['JSESSIONID'] = jsessionid
+        return cookies
+
+    @staticmethod
+    def _show_validate_code(cookies):
+        """
+        获取图片验证码
+        :return:
+        """
+        url = 'http://47.244.25.193:9091/servlet/validateCodeServlet?{}'.format(str(int(time.time() * 10 ** 3)))
+        response = requests.get(url, cookies=cookies, proxies=ABUYUN_PROXIES)
+        cookies.update(response.cookies.get_dict())
+        io_fp = BytesIO(response.content)
+        image = Image.open(io_fp)
+        image.show()
+
+        image_save_path = os.path.join(os.path.expandvars('$HOME'), 'verifycode.jpg')
+        image.save(image_save_path)
+        io_fp.close()
+        return cookies
+
+    def _verify_code(self, cookies):
+        while True:
+            cookies = self._show_validate_code(cookies)
+            code = input('请输出验证码,不区分大小写:\n\t')
+            url = 'http://47.244.25.193:9091/servlet/validateCodeServlet?validateCode={}'.format(code)
+            headers = deepcopy(self.headers)
+            headers['Referer'] = 'http://47.244.25.193:9091/admin/login;JSESSIONID={}'.format(cookies['JSESSIONID'])
+            response = requests.get(url, headers=headers, cookies=cookies, proxies=ABUYUN_PROXIES)
+            if response.text == 'true':
+                print('验证码验证成功')
+                self.code = code
+                return cookies
+            else:
+                time.sleep(3)
+                print('【ERROE】验证码错误，请重新输入')
+
+    def _login(self, cookies):
+        """
+        登录
+        :param: code验证码
+        :return:
+        """
+        user = self.user_pwd[self.platform]['user']
+        password = self.user_pwd[self.platform]['password']
+        first_url = 'http://47.244.25.193:9091/admin/login'
+        headers = deepcopy(self.headers)
+        headers['Referer'] = 'http://47.244.25.193:9091/admin/login;JSESSIONID={}'.format(cookies['JSESSIONID'])
+        data = {'username': user, 'password': password, 'validateCode': self.code}
+        response = requests.post(first_url, headers=headers, data=data, cookies=cookies, allow_redirects=False,
+                                 proxies=ABUYUN_PROXIES)
+        cookies.update(response.cookies.get_dict())
+        second_url = 'http://47.244.25.193:9091/admin?login'
+        headers = deepcopy(self.headers)
+        headers['Referer'] = 'http://47.244.25.193:9091/admin/login;JSESSIONID={}'.format(cookies['JSESSIONID'])
+        response = requests.get(second_url, headers=headers, cookies=cookies, proxies=ABUYUN_PROXIES)
+        if response.status_code == 200:
+            cookies.update(response.cookies.get_dict())
+            return cookies
+
+    def _update_cookies_after_login(self, cookies):
+        """
+        登录之后更新JSESSIONID
+        :return:
+        """
+        url = 'http://47.244.25.193:9091/static/bootstrap/2.3.1/css_cerulean/img/logo.png'
+        headers = deepcopy(self.headers)
+        headers['Referer'] = 'http://47.244.25.193:9091/static/bootstrap/2.3.1/css_cerulean/skin.min.css'
+        response = requests.get(url, headers=headers, cookies=cookies, proxies=ABUYUN_PROXIES)
+        cookies.update(response.cookies.get_dict())
+        return cookies
+
+    def get_token(self):
+        """
+        获取飞狗cookie，验证图片验证码
+        :return:
+        """
+        redis_cookies = self.redis_db7.hgetall('feigou_cookies')
+        if redis_cookies:
+            return redis_cookies
+        cookies = self._get_session_cookies()
+        cookies = self._verify_code(cookies)
+        cookies = self._login(cookies)
+        cookies = self._update_cookies_after_login(cookies)
+        cookies.update({'pageNo': '1', 'pageSize': '30'})
+        self.redis_db7.hmset('feigou_cookies', cookies)
+        return cookies
+
+    def get_phone(self, phone=None, *args, **kwargs):
+        # 不可排除号段
+        url = 'http://47.244.25.193:9091/admin/xiangyou/imProjectSimcardMsg/getPhoneNo'
+        headers = deepcopy(self.headers)
+        headers['Referer'] = 'http://47.244.25.193:9091/admin/xiangyou/' \
+                             'imProjectSimcardMsg/toGetMsg?tabPageId=jerichotabiframe_1'
+        data = {'imProjectId': self.sid,
+                'msgOpType': 'sj',
+                'msgType': '1'}
+        # msgType1 收短信类型;msgType 2发短信类型
+        if 'unlock' in self.pro_name:
+            data['msgType'] = '2'
+        if phone:
+            data['msgOpType'] = 'zdsjh'
+            data['phoneNo'] = phone
+        response = requests.post(url, headers=headers, data=data, cookies=self.cookies, proxies=ABUYUN_PROXIES)
+
+        if response.json().get('flag') == 'success':
+            try:
+                phone = response.json()['returnGetPhoneNoModel']['phoneNo']
+            except JSONDecodeError:
+                return
+            return phone
+
+    def get_phone_code(self, phone, retry_limit=None):
+        url = 'http://47.244.25.193:9091/admin/xiangyou/imProjectSimcardMsg/getSms'
+        headers = deepcopy(self.headers)
+        headers['Referer'] = 'http://47.244.25.193:9091/admin/xiangyou/' \
+                             'imProjectSimcardMsg/toGetMsg?tabPageId=jerichotabiframe_1'
+        headers['Origin'] = 'http://47.244.25.193:9091'
+        data = {'imProjectId': self.sid,
+                'phoneNo': phone,
+                'msgType': '1'}
+
+        retry_count = 0
+        retry_limit = retry_limit or random.randint(15, 20)
+        while retry_count < retry_limit:
+            retry_count += 1
+            print('第{}/{}次尝试获取验证码'.format(retry_count, retry_limit))
+            try:
+                response = requests.post(url, headers=headers, data=data, cookies=self.cookies, proxies=ABUYUN_PROXIES)
+                json_response = response.json()
+            except (ConnectionError, JSONDecodeError):
+                time.sleep(8)
+                continue
+            if json_response.get('flag') == 'success':
+                msg = json_response['imMsgContent'].get('msgTextContent')
+                if not msg:
+                    time.sleep(8)
+                    continue
+                # 微博验证码6位，如【微博】846667（微博登录验证码），此验证码只用于
+                # 豆瓣验证码4位
+                code_match = re.search('(\d{4,6})', msg)
+                if code_match:
+                    code = code_match.group(1)
+                    return code
+                else:
+                    time.sleep(8)
+
+    def release_phone(self, phone=None):
+        url = 'http://47.244.25.193:9091/admin/xiangyou/imProjectSimcardMsg/releasePhoneNo'
+        headers = deepcopy(self.headers)
+        headers['Referer'] = 'http://47.244.25.193:9091/admin/xiangyou/' \
+                             'imProjectSimcardMsg/toGetMsg?tabPageId=jerichotabiframe_1'
+        data = {'phoneNo': phone,
+                'msgType': '1',
+                'releaseFlag': '1'}
+        response = requests.post(url, headers=headers, data=data, cookies=self.cookies, proxies=ABUYUN_PROXIES)
+        if response.json().get('flag') == 'success':
+            return True
+
+    def send_sms(self, phone, code, deliver_no=None, retry_limit=4):
+        """
+        发送短信
+        :param phone: 手机号
+        :param code: 短信
+        :param deliver_no: 解锁号码（收短信的号码）, 并非所有平台支持此参数
+        :return:
+        """
+        url = 'http://47.244.25.193:9091/admin/xiangyou/imProjectSimcardMsg/sendSms'
+        headers = deepcopy(self.headers)
+        headers['Referer'] = 'http://47.244.25.193:9091/admin/xiangyou/imProjectSimcardMsg/toSendMsg'
+        data = {'phoneNo': phone,
+                'msgContent': code,
+                'imProjectId': self.sid,
+                'sendNo': '106902959527'
+                }
+        for retry in range(retry_limit):
+            try:
+                response = requests.post(url, headers=headers, data=data, cookies=self.cookies, proxies=ABUYUN_PROXIES)
+                if response.json().get('flag') == 'success':
+                    return True
+            except JSONDecodeError:
+                pass
+            time.sleep(6)
+
+    def get_send_sms_state(self, phone, retry_limit=None):
+        """
+        获取短信发送状态
+        :param phone: 手机号
+        :param retry_limit: 重试次数
+        :return:
+        """
+        url = 'http://47.244.25.193:9091/admin/xiangyou/imProjectSimcardMsg/getSms'
+        headers = deepcopy(self.headers)
+        headers['Referer'] = 'http://47.244.25.193:9091/admin/xiangyou/imProjectSimcardMsg/toSendMsg'
+        data = {'phoneNo': phone,
+                'msgType': 2,
+                'imProjectId': self.sid,
+                }
+        retry_count = 0
+        retry_limit = retry_limit or random.randint(15, 20)
+        while retry_count < retry_limit:
+            response = requests.post(url, headers=headers, data=data, cookies=self.cookies, proxies=ABUYUN_PROXIES)
+            if response.json().get('flag') == 'success':
+                time.sleep(3)
+                self.release_phone(phone)
+                return True
+            else:
+                retry_count += 1
+                time.sleep(4)
+
+    def add_blacklist(self, phone):
+        """
+        加入黑名单
+        :param phone: 手机号
+        :return:
+        """
+        pass
+
+
+class XinHe(PlatformBasic):
+    """
+    信盒接码平台
+    """
+    project_nos = {
+        'douban_unlock': '3751',
+        'douban_register': '3571',
+        'weibo_register': '3973'
+    }
+    headers = {'Accept': 'application/json, text/javascript, */*; q=0.01',
+               'Accept-Encoding': 'gzip, deflate',
+               'Accept-Language': 'en-US,en;q=0.9',
+               'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_4) '
+                             'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/78.0.3904.70 Safari/537.36',
+               }
+
+    def __init__(self, project):
+        platform = 'xinhe'
+        self.host = self.platform_hosts[platform]
+        super(XinHe, self).__init__(project, platform)
+        self.redis_db7 = generate_redis_connect('CZHAOs-iMac:6379/7')
+        self.token = self.get_token()
+
+    def get_token(self):
+        if self.redis_db7.exists('xinhe_token'):
+            return self.redis_db7.get('xinhe_token')
+        user = self.user_pwd[self.platform]['user']
+        password = self.user_pwd[self.platform]['password']
+        url = 'http://api.xinheyz.com/api/do.php?action=loginIn&name={}&password={}'.format(user, password)
+        response = requests.get(url)
+        token = self.string_response_manager(response)
+
+        if token:
+            self.redis_db7.set('xinhe_token', token)
+        return token
+
+    def get_phone(self, phone=None, excludeno=list()):
+        """
+        获取手机号
+        :param phone: 手机号
+        :param excludeno: 排除号段
+        :return:
+        """
+        params = {'sid': self.sid, 'token': self.token, 'vn0': '0', 'action': 'getPhone'}  # vno=0 表示排除虚拟运营商。
+        if phone:
+            params['phone'] = phone
+        url = 'http://api.xinheyz.com/api/do.php'
+        response = requests.get(url, params=params)
+        phone = self.string_response_manager(response)
+        return phone
+
+    def get_phone_code(self, phone, retry_limit=15):
+        """
+        获取验证码
+        :param: phone: 手机号
+        :param: retry_limit: 重试次数
+        :return:
+        """
+        retry_count = 0
+        url = 'http://api.xinheyz.com/api/do.php?action=getMessage&sid={}&phone={}&token={}'.format(
+            self.sid, phone, self.token)
+        while retry_count < retry_limit:
+            response = requests.get(url)
+            sms_content = self.string_response_manager(response)
+            if sms_content:
+                code_match = re.search('(\d{4,6})', sms_content)
+                if code_match:
+                    code = code_match.group(1)
+                    return code
+            time.sleep(3)
+            retry_count += 1
+
+    def send_sms(self, phone, code, deliver_no=None):
+        pass
+
+    def get_send_sms_state(self, phone):
+        pass
+
+    def release_phone(self, phone=None):
+        """
+        释放手机号
+        :param phone: 手机号, phone为空则释放所有手机号
+        :return:
+        """
+        params = {
+            'token': self.token,
+        }
+        if phone:
+            params.update({'phone': phone,
+                           'action': 'cancelRecv',
+                           'sid': self.sid})
+        else:
+            params['action'] = 'cancelAllRecv'
+        url = 'http://api.xinheyz.com/api/do.php'
+        response = requests.get(url, params=params)
+        status = self.string_response_manager(response)
+        return status
+
+    def add_blacklist(self, phone):
+        """
+        加入黑名单
+        :param phone: 手机号
+        :return:
+        """
+        url = 'http://api.xinheyz.com/api/do.php?action=addBlacklist&sid={}&phone={}&token={}'.format(
+            self.sid, phone, self.token)
+        response = requests.get(url)
+        status = self.string_response_manager(response)
+        return status
+
+
+class MiLi(PlatformBasic):
+    project_nos = {
+        'beike_register': '25150',
+        # 'maimai_register': '4083',
+        # 'maimai_register': '933',
+        'douban_register': '5545',
+        'douban_unlock': '14669',  # 收发两用
+        'tongcheng_register': '37873'
+
+    }
+
+    def __init__(self, project):
+        platform = "mili"
+        # self.host = "http://www.mili18.com:9000/"
+        self.host = self.platform_hosts[platform]
+        super().__init__(project, platform)
+
+        self.redis_db7 = generate_redis_connect('CZHAOs-iMac:6379/7')
+        token = self.redis_db7.get('mili_token')
+        # token = '525EABC690A7AAE557A5CA2C3AC8C292'
+        if token:
+            self.token = token
+        else:
+            self.token = self.login()
+        print('当前token', self.token)
+
+    def get_balance(self):
+        """
+        获取账号余额
+        :return: float
+        """
+        action = 'GetBalanceStr?'
+        # url = 'http://www.mili18.com:9180/service.asmx/GetBalanceStr?'
+        url = self.host+action
+        params = {
+            "name": self.user_pwd[self.platform]['user'],
+            "psw": self.user_pwd[self.platform]['password']
+        }
+        res = requests.get(url, params=params)
+        balance = re.match('(\d*\.\d{2})\s', res.text)
+        if balance:
+            balance = float(balance.group(1))
+            return balance
+        else:
+            print('获取账号余额失败，response:')
+            print(res)
+            return res
+
+    def login(self):
+        action = 'UserLoginStr?'
+        user = self.user_pwd[self.platform]['user']
+        password = self.user_pwd[self.platform]['password']
+        params = dict(
+            name=user,
+            psw=password
+        )
+        # url = "http://www.mili18.com:9180/service.asmx/UserLoginStr?"
+        url = self.host+action
+        res = requests.get(url, params=params)
+        self.redis_db7.set('mili_token', res.text, ex=timedelta(days=1))
+        self.token = res.text
+        return res.text
+
+    def get_phone(self, phone=None, excludeno=list(), **kwargs):
+        action = 'GetHM2Str?'
+        if phone is None:
+            params = {
+                "token": self.token,
+                "xmid": self.sid,
+                "sl": "1",
+                "lx": "0",
+                "a1": "",
+                "a2": "",
+                "pk": "",
+                "ks": "0",
+                "rj": ""
+            }
+            # url = "http://www.mili18.com:9180/service.asmx/GetHM2Str?"
+            url = self.host + action
+            res = requests.get(url, params=params)
+            return res.text[3:]
+        else:
+            return self.get_specified_phone(phone, **kwargs)
+
+    def get_specified_phone(self, phone, timeout=0):
+        action = 'mkHM2Str?'
+        params = {
+            "token": self.token,
+            "xmid": self.sid,
+            "hm": phone,
+            "op": "1",
+            "pk": "",
+            "rj": ""
+        }
+        # url = "http://www.mili18.com:9180/service.asmx/mkHM2Str?"
+        url = self.host + action
+        end_time = time.time() + timeout
+        res = requests.get(url, params=params)
+        print(f'response.text: {res.text}')
+        if res.text == '1':
+            return True
+        elif res.text == '-3':
+            while time.time() < end_time:
+                time.sleep(10)
+                res = requests.get(url, params=params)
+                print(f'response.text: {res.text}')
+                if res.text == '1':
+                    return True
+            else:
+                return False
+        elif res.text == '-5':
+            self.release_phone(phone)
+            return self.get_specified_phone(phone)
+        elif res.text == '-8':
+            send_slack("czhao", message="余额不足扣费", token="czhao")
+            send_message('mili接码平台余额不足', '萤火虫', source="code_platform.py")
+            return False
+        elif res.text == '-2':
+            print('当前手机号不在线', phone)
+            return False
+
+    def _get_phone_code(self, phone):
+        action = 'GetYzm2Str?'
+        params = {
+            "token": self.token,
+            "xmid": self.sid,
+            "hm": phone,
+            "sf": "1",
+        }
+        # url = " http://www.mili18.com:9180/service.asmx/GetYzm2Str?"
+        url = self.host + action
+        res = requests.get(url, params).text
+        return res
+
+    def get_phone_code(self, phone, retry_limit=5):
+        retry_count = 0
+        print("waiting code")
+        time.sleep(10)
+        while retry_count < retry_limit:
+            res = self._get_phone_code(phone)
+            print(res)
+            if res == "1":
+                print("waiting code")
+                time.sleep(3)
+            elif len(res) > 4:
+                if self.pro_name == "maimai_register":
+                    code_match = re.search('验证码[:：]\s?(\d{4,6})', res)
+                elif self.pro_name == "douban_register":
+                    if '登录验证码' in res:
+                        print(f'账号{phone}为登录类型, pass')
+                        return
+                    code_match = re.search('验证码[:：]\s?(\d{4,6})', res)
+                else:
+                    code_match = re.search('您的手机验证码为(\d{4,6})', res)
+                if code_match:
+                    code = code_match.group(1)
+                    return code
+                return
+            elif res == "0":
+                self.token = self.login()
+            elif res == "-2":
+                send_slack("czhao", message="业务已被取消，可重试重新操作语音验证", token="czhao")
+                return
+            elif res == "-8":
+                send_slack("czhao", message="余额不足扣费", token="czhao")
+                return
+            retry_count += 1
+
+    def release_phone(self, phone=None):
+        """
+        释放手机号码
+        :param: phone:手机号
+        :return:
+        """
+        if not phone:
+            action = 'sfAllStr?'
+            # url = 'http://www.mili18.com:9180/service.asmx/sfAllStr?'
+            url = self.host + action
+            params = {
+                "token": self.token
+            }
+        else:
+            action = 'sfHmStr?'
+            # url = 'http://www.mili18.com:9180/service.asmx/sfHmStr?'
+            url = self.host + action
+            params = {
+                "token": self.token,
+                "hm": phone}
+        response = requests.get(url, headers=self.headers, params=params)
+        status = self.string_response_manager(response)
+        return status
+
+    def send_sms(self, phone, code, deliver_no=None, retry_limit=4):
+        """
+        发送短信
+        :param phone: 手机号
+        :param code: 短信
+        :param deliver_no: 解锁号码（收短信的号码）, 并非所有平台支持此参数
+        :param retry_limit: 重试次数
+        :return:
+        """
+        action = 'SendSms3Str'
+        # url = "http://www.mili18.com:9180/service.asmx/SendSms3Str"
+        url = self.host + action
+        params = {'token': self.token,
+                  "xmid": self.sid,
+                  'hm': phone,
+                  'nr': code,
+                  "pk": "",
+                  "rj": "",
+                  "rhm": deliver_no
+                  }
+        for i in range(retry_limit):
+            res = requests.get(url, params=params)
+            text = res.text
+            # print('发短信', text)
+            if text == "1":
+                print('短信请求已发送', phone)
+                return True
+            elif text == '-8':
+                send_slack("czhao", message="余额不足扣费", token="czhao")
+                os._exit(0)
+                return
+            time.sleep(3)
+
+    def get_send_sms_state(self, phone, retry_limit=None):
+        """
+        获取短信发送状态
+        :param phone: 手机号
+        :param retry_limit: 重试次数
+        :return:
+        """
+        action = 'GetFsState'
+        # url = 'http://www.mili18.com:9180/service.asmx/GetFsState'
+        url = self.host + action
+        params = {'token': self.token,
+                  'xmid': self.sid,
+                  'hm': phone,
+                  }
+        retry_count = 0
+        retry_limit = retry_limit or random.randint(15, 20)
+        while retry_count < retry_limit:
+            res = requests.get(url, params=params)
+            text = res.text
+            if text == '发送成功':
+                return True
+            elif text == '0':  # 未登陆
+                self.login()
+            elif text == '发送失败':
+                return False
+            elif text == '1':
+                print(phone, '还没反馈结果,重试中')
+            time.sleep(6)
+            retry_count += 1
+
+    def add_blacklist(self, phone):
+        """
+        加入黑名单
+        :param phone: 手机号
+        :return:
+        """
+        action = 'Hmd2Str'
+        # url = 'http://www.mili18.com:9180/service.asmx/Hmd2Str'
+        url = self.host + action
+        params = {'token': self.token,
+                  'xmid': self.sid,
+                  'hm': phone,
+                  'sf': 1}
+        res = requests.get(url, params=params)
+        if res.text == '1':
+            return True
+
+
+class HKNumber(PlatformBasic):
+    project_nos = {
+        'douban_register': '17453',
+
+    }
+
+    def __init__(self, project):
+        platform = "hk_number"
+        self.host = "https://www.hknumber.xyz/api.php"
+        super().__init__(project, platform)
+
+        self.redis_db7 = generate_redis_connect('CZHAOs-iMac:6379/7')
+        token = self.redis_db7.get('hk_number_token')
+        if token:
+            self.token = token
+        else:
+            self.token = self.login()
+
+    def login(self):
+        user = self.user_pwd[self.platform]['user']
+        password = self.user_pwd[self.platform]['password']
+        url = 'https://www.hknumber.xyz/api.php?do=GetToken&user={}&passwd={}'.format(user, password)
+        response = requests.get(url=url)
+        token = response.json().get('token')
+        return token
+
+    def get_phone(self, phone=None, *args, **kwargs):
+        retry_limit = kwargs.get('retry_limit')
+        retry_limit = retry_limit if retry_limit else 15
+        for loop in range(retry_limit):
+            try:
+                url = 'https://www.hknumber.xyz/api.php?do=GetPhone&token={}&xmid={}'.format(self.token, self.sid)
+                response = requests.get(url=url)
+                phone = response.json().get('phone')
+                break
+            except (MaxRetryError, SSLError):
+                time.sleep(8)
+                continue
+        return phone
+
+    def get_phone_code(self, phone, retry_limit=15):
+        url = 'https://www.hknumber.xyz/api.php?do=GetSMS&token={}&xmid={}&phone={}'.format(self.token, self.sid, phone)
+        for i in range(retry_limit):
+            try:
+                response = requests.get(url=url)
+            except (MaxRetryError, SSLError):
+                time.sleep(8)
+                continue
+            print(response.text)
+
+            sms = response.json().get('sms')
+            print('短信', sms)
+            if sms:
+                # 豆瓣短信格式 2020-01-02 11:37:56收到 豆瓣注册验证码：8241，请在20分钟内使用
+                # 豆瓣绑定手机验证码/豆瓣帐号验证码：8543
+                # 豆瓣解除帐号异常验证码：8615
+                match = re.search('验证码：(\d{4})', sms)
+                if match:
+                    code = match.group(1)
+                    return code
+            time.sleep(10)
+            print('第{}次重试'.format(i))
+
+    def release_phone(self, phone=None):
+        url = 'https://www.hknumber.xyz/api.php?do=ShiFang&token={}'.format(self.token)
+        response = requests.get(url=url)
+        status = response.json().get('status')
+        if int(status) == 1:
+            return True
+
+    def send_sms(self, phone, code, deliver_no=None):
+        pass
+
+    def get_send_sms_state(self, phone):
+        pass
+
+    def add_blacklist(self, phone):
+        pass
+
+
+class BanMa(PlatformBasic):
+    # BanMa接码平台很容易到达频率控制上限，高频注册需使用ABUYUN_PROXIES
+    project_nos = {
+        # 'douban_register': '639',
+        'douban_register': '7113',
+        '58': '3636'
+    }
+
+    def __init__(self, project):
+        platform = "banma"
+        self.host = "http://api.banma1024.net/api/do.php"
+        super().__init__(project, platform)
+
+        self.redis_db7 = generate_redis_connect('CZHAOs-iMac:6379/7')
+        token = self.redis_db7.get('banma_token')
+        if token:
+            self.token = token
+        else:
+            self.token = self.login()
+
+    def login(self):
+        user = self.user_pwd[self.platform]['user']
+        password = self.user_pwd[self.platform]['password']
+        url = 'http://api.banma1024.net/api/do.php?action=loginIn&name={}&password={}'.format(user, password)
+        response = requests.get(url=url)
+        # response = requests.get(url=url, proxies=ABUYUN_PROXIES)
+        token = self.string_response_manager(response)
+        if token:
+            self.redis_db7.set('banma_token', token)
+            return token
+
+    def get_phone(self, phone=None, rety_limit=15, *args, **kwargs):
+        url = 'http://api.banma1024.net/api/do.php?action=getPhone&token={}&sid={}'.format(self.token, self.sid)
+        for i in range(rety_limit):
+            time.sleep(3)
+            # response = requests.get(url=url, proxies=ABUYUN_PROXIES)
+            response = requests.get(url=url)
+            phone = self.string_response_manager(response)
+            if phone:
+                return phone
+
+    def get_phone_code(self, phone, retry_limit=15):
+        url = 'http://api.banma1024.net/api/do.php?action=getMessage&token' \
+              '={}&sid={}&phone={}'.format(self.token, self.sid, phone)
+        for i in range(retry_limit):
+
+            response = requests.get(url=url)
+            # response = requests.get(url=url, proxies=ABUYUN_PROXIES)
+            sms = self.string_response_manager(response)
+            if sms:
+                print(sms)
+                # 目前豆瓣登录类型账号均不可用
+                if self.pro_name == "douban_register":
+                    if '登录验证码' in sms:
+                        print(f'账号{phone}为登录类型, pass')
+                        return
+                # 豆瓣短信格式 2020-01-02 11:37:56收到 豆瓣注册验证码：8241，请在20分钟内使用。（请确保是本人操作且为本人手机，否则请忽略此短信）
+                if "豆瓣" in sms:
+                    match = re.search('验证码：(\d{4})', sms)
+                elif "同城" in sms:
+                    match = re.search('验证码(\d{6})', sms)
+                else:
+                    match = ''
+                if match:
+                    code = match.group(1)
+                    return code
+            print('第{}次获取失败，短信内容{}'.format(i + 1, sms))
+            time.sleep(3)
+
+    def add_blacklist(self, phone):
+        time.sleep(3)
+        url = 'http://api.banma1024.net/api/do.php?action=addBlacklist&sid={}' \
+              '&phone={}&token={}'.format(self.sid, phone, self.token)
+        response = requests.get(url=url)
+        # response = requests.get(url=url, proxies=ABUYUN_PROXIES)
+        status = self.string_response_manager(response)
+        if status == '操作成功':
+            return True
+
+    def release_phone(self, phone=None):
+        time.sleep(3)
+        if phone:
+            url = 'http://api.banma1024.net/api/do.php?action=cancelRecv&sid={}' \
+                  '&phone={}&token={}'.format(self.sid, phone, self.token)
+        else:
+            url = 'http://api.banma1024.net/api/do.php?action=cancelAllRecv&token={}'.format(self.token)
+        response = requests.get(url=url)
+        # response = requests.get(url=url, proxies=ABUYUN_PROXIES)
+        status = self.string_response_manager(response)
+        if status == '操作成功':
+            return True
+
+    def send_sms(self, phone, code, deliver_no=None):
+        pass
+
+    def get_send_sms_state(self, phone):
+        pass
+
+
+class XinGe(PlatformBasic):
+    """
+    信鸽接码平台
+    """
+    project_nos = {
+        'douban_register': '29352',
+        'maimai_register': '28847',
+        '58': '25755'
+    }
+
+    def __init__(self, project):
+        platform = "xinge"
+        self.host = "http://api.reyne.cn/api/do.php"
+        super().__init__(project, platform)
+
+        self.redis_db7 = generate_redis_connect('CZHAOs-iMac:6379/7')
+        token = self.redis_db7.get('xinge_token')
+        if token:
+            self.token = token
+        else:
+            self.token = self.login()
+
+    def get_balance(self):
+        """
+        获取账号余额
+        :return: float
+        """
+        url = 'http://api.reyne.cn/api/do.php?action=getSummary&token={}'.format(self.token)
+        response = requests.get(url=url)
+        print(response.text)
+        balance = response.text.split('|')[1]
+        return float(balance)
+
+    def login(self):
+        user = self.user_pwd[self.platform]['user']
+        password = self.user_pwd[self.platform]['password']
+        url = 'http://api.reyne.cn/api/do.php?action=loginIn&name={}&password={}'.format(user, password)
+        response = requests.get(url=url)
+        token = self.string_response_manager(response)
+        if token:
+            print('token', token)
+            self.redis_db7.set('xinge_token', token)
+            return token
+
+    def get_phone(self, phone=None, rety_limit=15, *args, **kwargs):
+        if phone:
+            url = 'http://api.reyne.cn/api/do.php?action=getPhone&sid={}&token={}&phone={}' \
+                .format(self.sid, self.token, phone)
+        else:
+            url = 'http://api.reyne.cn/api/do.php?action=getPhone&sid={}&token={}'.format(self.sid, self.token)
+        for i in range(rety_limit):
+            time.sleep(3)
+            response = requests.get(url=url)
+            phone = self.string_response_manager(response)
+            if phone:
+                return phone
+
+    def get_phone_code(self, phone, retry_limit=15):
+        url = 'http://api.reyne.cn/api/do.php?action=getMessage&sid={}&phone={}&token={}&author={}'.format(
+            self.sid, phone, self.token, self.user_pwd[self.platform]['user'])
+        for i in range(retry_limit):
+
+            response = requests.get(url=url)
+            sms = self.string_response_manager(response)
+            if sms:
+                if self.pro_name == "douban_register" and '登录验证码' in sms:
+                    print(f'账号{phone}为登录类型, pass')
+                    return
+                print('短信', sms)
+                # 豆瓣短信格式 2020-01-02 11:37:56收到 豆瓣注册验证码：8241，请在20分钟内使用。（请确保是本人操作且为本人手机，否则请忽略此短信）
+                match = re.search('验证码：(\d{4})', sms)
+                if match:
+                    code = match.group(1)
+                    return code
+            print('第{}次获取失败，短信内容{}'.format(i + 1, sms))
+            time.sleep(3)
+
+    def add_blacklist(self, phone):
+        time.sleep(3)
+        url = 'http://api.reyne.cn/api/do.php?action=addBlacklist&sid={}&phone={}&token={}'.format(
+            self.sid, phone, self.token)
+        response = requests.get(url=url)
+        status = self.string_response_manager(response)
+        return status
+
+    def release_phone(self, phone=None):
+        time.sleep(3)
+        if phone:
+            url = 'http://api.reyne.cn/api/do.php?action=cancelRecv&sid={}&phone={}&token={}'.format(
+                self.sid, phone, self.token)
+        else:
+            url = 'http://api.reyne.cn/api/do.php?action=cancelAllRecv&token={}'.format(self.token)
+        response = requests.get(url=url)
+        status = self.string_response_manager(response)
+        return status
+
+    def send_sms(self, phone, code, deliver_no=None):
+        url = 'http://api.reyne.cn/api/do.php?action=putSentMessage&phone={}&sid={}&message={}&recvPhone={}&token={}'. \
+            format(phone, self.sid, code, deliver_no, self.token)
+        response = requests.get(url=url)
+        status = self.string_response_manager(response)
+        return status
+
+    def get_send_sms_state(self, phone):
+        url = 'http://api.reyne.cn/api/do.php?action=getSentMessageStatus&phone={}&sid={}&token={}'. \
+            format(phone, self.sid, self.token)
+        response = requests.get(url=url)
+        status = self.string_response_manager(response)
+        return status
+
+
+class MDS(PlatformBasic):
+    """
+    码大帅接码平台 http://mds.js.sdmpay.com/
+    """
+
+    project_nos = {
+        'douban_register': '7891'
+    }
+
+    def __init__(self, project):
+        platform = "mds"
+        super().__init__(project, platform)
+
+        self.redis_db7 = generate_redis_connect('CZHAOs-iMac:6379/7')
+        token = self.redis_db7.get('mds_token')
+        if token:
+            self.token = token
+        else:
+            self.token = self.login()
+
+    def login(self):
+        user = self.user_pwd[self.platform]['user']
+        password = self.user_pwd[self.platform]['password']
+        url = 'http://43.249.193.217:81/logon/username={}&password={}'.format(user, password)
+        response = requests.get(url=url)
+        token = self.string_response_manager(response)
+        if token:
+            self.redis_db7.set('mds_token', token)
+            return token
+
+    def get_phone(self, phone=None, rety_limit=15, *args, **kwargs):
+        if phone:
+            url = 'http://43.249.193.217:81/Getnumber/id={}&operator=0&Region=0&card=2&phone={}&loop=1&token={}'.format(
+                phone, self.sid, self.token)
+        else:
+            url = 'http://43.249.193.217:81/Getnumber/id={}&operator=0&' \
+                  'Region=0&card=0&loop=1&token={}'.format(self.sid, self.token)
+        for i in range(rety_limit):
+            response = requests.get(url=url)
+            phone = self.string_response_manager(response)
+            if phone:
+                return phone
+            time.sleep(3)
+
+    def get_phone_code(self, phone, retry_limit=15):
+        url = 'http://43.249.193.217:81/Getsms/id={}&phone={}&t={}&token={}'.format(
+            self.sid, phone, self.user_pwd[self.platform]['user'], self.token)
+        for i in range(retry_limit):
+
+            time.sleep(5)
+            response = requests.get(url=url)
+            print('响应', response.text)
+            sms = self.string_response_manager(response)
+            if sms:
+                print('短信', sms)
+                # 豆瓣短信格式 2020-01-02 11:37:56收到 豆瓣注册验证码：8241，请在20分钟内使用。（请确保是本人操作且为本人手机，否则请忽略此短信）
+                match = re.search('验证码：(\d{4})', sms)
+                if match:
+                    code = match.group(1)
+                    return code
+            print('第{}次获取失败，短信内容{}'.format(i + 1, sms))
+
+    def add_blacklist(self, phone):
+        time.sleep(3)
+        url = 'http://43.249.193.217:81/Addblacklist/id={}&phone={}&token={}'.format(
+            self.sid, phone, self.token)
+        response = requests.get(url=url)
+        status = self.string_response_manager(response)
+        return status
+
+    def release_phone(self, phone=None):
+        time.sleep(3)
+        if phone:
+            url = 'http://43.249.193.217:81/release/id={}&phone={}&token={}'.format(
+                self.sid, phone, self.token)
+        else:
+            print('码大帅仅支持单个账号释放')
+            return
+        response = requests.get(url=url)
+        status = self.string_response_manager(response)
+        return status
+
+    def send_sms(self, phone, code, deliver_no=None):
+        url = 'http://43.249.193.217:81/Sendmessage/id={}&phone={}&send={}&content={}&token={}'. \
+            format(self.sid, phone, deliver_no, code, self.token)
+        response = requests.get(url=url)
+        status = self.string_response_manager(response)
+        return status
+
+    def get_send_sms_state(self, phone):
+        url = 'http://43.249.193.217:81/Getsms/id={}&phone={}&t={}&token={}'. \
+            format(self.sid, phone, self.user_pwd[self.platform]['user'], self.token)
+        response = requests.get(url=url)
+        status = self.string_response_manager(response)
+        return status
+
+
+class SmsApi(object):
+    """
+    此接码平台为美国号
+    此接码平台号码和对应的取码url是俊有提供的，存储在redis的；
+    一个号码对应一个取码url，如下：
+    8735013044 https://api.smsapi.vip/api/get/message/token=494c00e244da93c4a058d8a1ece1b051
+    8737303063 https://api.smsapi.vip/api/get/message/token=8360320f50cc6f3ce80b717fe2f5a4af
+    8737388141 https://api.smsapi.vip/api/get/message/token=a118c12591a14cbd67f658db42463bd3
+    """
+    r_conn = generate_redis_connect('CZHAOs-iMac:6379/7')
+
+    def __init__(self, pro_name):
+        pass
+
+    def get_phone(self, *args, **kwargs):
+        phone = self.r_conn.spop('sms_api_account')
+        if phone is None:
+            print('账号不足')
+            return
+        return phone
+
+    def get_phone_code(self, phone, retry_limit=15, *args, **kwargs):
+        url = self.r_conn.hget('sms_api_account2token_url', phone)
+        headers = {'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_4) AppleWebKit/537.36 '
+                                 '(KHTML, like Gecko) Chrome/80.0.3987.116 Safari/537.36'}
+        for loop in range(retry_limit):
+            response = requests.get(url, headers=headers)
+            text = response.text
+            # 豆瓣短信格式 2020-01-02 11:37:56收到 豆瓣注册验证码：8241，请在20分钟内使用
+            # 豆瓣绑定手机验证码/豆瓣帐号验证码：8543
+            # 豆瓣解除帐号异常验证码：8615
+            match = re.search('验证码：(\d{4})', text)
+            if match:
+                code = match.group(1)
+                return code
+            time.sleep(2)
+
+    def add_blacklist(self, phone):
+        pass
