@@ -8,6 +8,18 @@ from collections import OrderedDict
 logger = logging.getLogger(__name__)
 
 
+class PathNotInClientViewError(P4Exception):
+    pass
+
+
+class FindP4pathFailError(P4Exception):
+    pass
+
+
+class P4ClientOverwriteError(P4Exception):
+    pass
+
+
 class P4ConnectResetException(P4Exception):
     @staticmethod
     def catch(msg):
@@ -165,6 +177,8 @@ class P4Client:
             self.p4config.workspace = self._p4.client
         logger.info(self.connect())
         logger.info(self.login())
+
+        # 更新p4 workspace配置
         if not self.is_client_exist(client):
             self.client = self._p4.fetch_client()
             self.client.update(client_config)
@@ -172,6 +186,11 @@ class P4Client:
             self.client = self._p4.fetch_client()
         else:
             self.client = self._p4.fetch_client()
+        # self.client = self._p4.fetch_client()
+        # self.client.update(client_config)
+        # self._p4.save_client(self.client)
+        # self.client = self._p4.fetch_client()
+
         self.root = self.client['Root']
         self.file_map_of_view, self.ordered_dir_map_of_view = self.get_file_map_and_ordered_dir_map_from_view()
         self.is_windows = (os.name == 'nt')
@@ -241,7 +260,7 @@ class P4Client:
         else:
             raise_error = True
         if raise_error:
-            raise ValueError("'%s' 不在 p4 client 的根目录下" % local_path)
+            raise PathNotInClientViewError("'%s' 不在 p4 client 的根目录下" % local_path)
         workspace = self.p4config.workspace
         client_p4_path = f'//{workspace}' + local_path[len(self.root):]
         if '\\' in client_p4_path:
@@ -263,7 +282,7 @@ class P4Client:
                 if p4_path.startswith(key):
                     client_p4_path = p4_path.replace(key, value, 1)
                     return client_p4_path
-        raise ValueError("'%s' is not in client view" % p4_path)
+        raise PathNotInClientViewError("'%s' is not in client view" % p4_path)
 
     def client_p4_path_to_p4_path(self, client_p4_path: str):
         client_file_map = {value: key for key, value in self.file_map_of_view.items()}
@@ -274,7 +293,7 @@ class P4Client:
                 if client_p4_path.startswith(value):
                     p4_path = client_p4_path.replace(value, key, 1)
                     return p4_path
-        raise ValueError("'%s' is not in client view" % client_p4_path)
+        raise PathNotInClientViewError("'%s' is not in client view" % client_p4_path)
 
     @redefine_p4exception
     def connect(self):
@@ -334,9 +353,38 @@ class P4Client:
             self.recreate_p4_connection()
             return self.__login()
 
+    def domain(self, p4path):
+        return P4Domain(self, p4path)
+
+    def get_content(self, file_p4path):
+        from flask import send_from_directory
+        with self.domain(file_p4path):
+            dir_path, filename = os.path.split(self.to_local_path(file_p4path))
+            return send_from_directory(dir_path, filename)
+
     def sync(self, *args, **kwargs):
+        # if not self.is_windows:
+        #     for arg in args:
+        #         if has_chinese(arg):
+        #             return self.sync_chinese(arg)
         kwargs['encoding'] = 'gbk'
         return self.run_sync(*args, **kwargs)
+
+    def sync_chinese(self, p4_path):
+        from ..config import bin_dir
+        import subprocess
+        if self.is_windows:
+            return self.sync('-f', p4_path)
+        else:
+            p4_cn_full_path = os.path.join(bin_dir, 'p4cn')
+            logger.info(f'[sync_chinese] {p4_cn_full_path}')
+            shell_script = f"""chmod +x {p4_cn_full_path};{p4_cn_full_path} sync -P {self.p4config.password} -u {self.p4config.user} -c {self.p4config.workspace} -p {self.p4config.port} {p4_path}"""
+            # subprocess.Popen(shell_script, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            logger.info(shell_script)
+            result = subprocess.check_output(["/bin/sh", "-c", shell_script], stderr=subprocess.STDOUT)
+            import pdb
+            pdb.set_trace()
+            return result
 
     def sync_dir(self, p4_dir_path: str, *options):
         p4_dir_path = self.__format_p4_dir(p4_dir_path)
@@ -365,9 +413,10 @@ class P4Client:
             return self.does_file_exist(p4_path)
 
     @staticmethod
-    def is_dir(p4_path: str):
+    def is_dir(p4_path: str) -> bool:
         if p4_path.endswith('/*') or p4_path.endswith('/...') or p4_path.endswith('/'):
             return True
+        return False
 
     def does_dir_exist(self, p4_dir_path: str):
         try:
@@ -381,7 +430,7 @@ class P4Client:
         try:
             files = self.files(p4_dir)
             for file_info in files:
-                if file_info['depotFile'] == p4_file_path:
+                if file_info['depotFile'].lower() == p4_file_path.lower():
                     return True
             return False
         except P4FileNotExistException:
@@ -418,7 +467,7 @@ class P4Client:
         """编辑指定文件，覆盖原有内容"""
         if content is None:
             if content_path is None:
-                raise ValueError("参数content 和 content_path 值不能同时为空")
+                raise P4ClientOverwriteError("参数content 和 content_path 值不能同时为空")
             with open(content_path, mode=read_mode) as f:
                 content = f.read()
         res = self.edit(file_path)
@@ -445,6 +494,57 @@ class P4Client:
         return self.run_describe(*changelist_nums)
 
 
+class P4Domain(object):
+    def __init__(self, p4: P4Client, p4path):
+        self.p4 = p4
+        self.p4path = p4path
+        self.local_chinese_dir = ''
+        if not self.p4.is_windows:
+            self.local_chinese_dir = self.get_chinese_dir(p4.to_local_path(p4path))
+
+    def __enter__(self):
+        if self.local_chinese_dir:
+            convmv_gbk_to_utf8(self.local_chinese_dir)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.local_chinese_dir:
+            convmv_utf8_to_gbk(self.local_chinese_dir)
+
+    @staticmethod
+    def get_chinese_dir(local_path) -> str:
+        parts = local_path.split(os.path.sep)
+        i = 0
+        while i < len(parts):
+            if has_chinese(parts[i]):
+                break
+            i += 1
+        else:
+            return ''
+        local_chinese_dir = os.path.sep.join(parts[:i])
+        return local_chinese_dir
+
+
+def has_chinese(string):
+    """
+    检查整个字符串是否包含中文
+    :param string: 需要检查的字符串
+    :return: bool
+    """
+    for ch in string:
+        if u'\u4e00' <= ch <= u'\u9fff':
+            return True
+    return False
+
+
+def convmv_gbk_to_utf8(local_chinese_dir):
+    os.system(f'convmv -f gbk -t utf-8 "{local_chinese_dir}"/* -r --notest --replace')
+
+
+def convmv_utf8_to_gbk(local_chinese_dir):
+    os.system(f'convmv -t gbk -f utf-8 "{local_chinese_dir}"/* -r --notest --replace')
+
+
 def test():
     # client_config = {
     #     'Root': os.path.abspath(__file__ + '//..' * 5),
@@ -463,4 +563,46 @@ def test():
 
 
 if __name__ == '__main__':
-    test()
+    from pprint import pprint
+    from server.src.core.xlsxutils import load_data_from_excel
+    # p4_client = P4Client('chenaizhen', 'm8ywem', 'x5mobile-pipeline-service-test2', client_config={})
+    # p4_client = P4Client('dgm_auto', 'dgm!@!111', 'jenkins-effect-android-package', client_config={})
+    if os.name == 'nt':
+        p4_client = P4Client('dress_pm_cloth', '123', 'dress_collocation_debug', client_config={})
+    else:
+        p4_client = P4Client('dress_pm_cloth', '123', 'dress_collocation_linux_debug', client_config={})
+    # p4_client = P4Client('dgm_auto', 'dgm!@!111', 'jenkins-android-branch-texture-package', client_config={})
+    pprint(p4_client.get_view())
+    # pprint(p4_client.run_changes('-m 5', '-L','//x5_mobile/mr/art_release_test/art_src/campaign/dollarpurchase/...'))
+    # pprint(p4_client.run_describe('-I 1560750'))
+    # pprint(p4_client.run_describe('-s', '1559867'))
+    # pprint(p4_client.run_describe('-s', '1559921'))
+    # pprint(p4_client.run_describe('1559921'))
+    # pprint(p4_client.run_describe('21559921'))
+    # pprint(p4_client.describe_many('1559867', '1559921'))
+    # pprint(p4_client.describe_many('1559921', '1559867'))
+    # pprint(p4_client.run_changes('-m 10', '//project_dress/mr/Resources/art_src/texture/item_icon/...'))
+    item_name_p4_path = '//project_dress/dress_doc/文档管理/策划文档/版本投放表/【平台使用】投放途径对照表.xlsx'
+    item_name_local_path = p4_client.to_local_path(item_name_p4_path)
+    res = p4_client.sync('-f', item_name_p4_path)
+    # print(res)
+    with p4_client.domain(item_name_p4_path):
+        xlsx_data = load_data_from_excel(item_name_local_path, has_header=True)
+        sheet_data = xlsx_data[0]
+    print(sheet_data.headers)
+    import pdb
+    pdb.set_trace()
+    r = p4_client.describe('1559867')
+    pprint(r)
+    print('r:', type(r))
+    # try:
+    #     test()
+    # except P4Exception as err:
+    #     print(err)
+    #     print(err.__dict__)
+    #     print(err.__class__)
+    #     print(err.__class__.__name__)
+    #     print(type(err).__name__)
+    #     print(p4_client.errors)
+    #     import pdb
+    #     pdb.set_trace()
