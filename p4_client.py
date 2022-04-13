@@ -498,9 +498,13 @@ class P4Domain(object):
     def __init__(self, p4: P4Client, p4path):
         self.p4 = p4
         self.p4path = p4path
-        self.local_chinese_dir = ''
+        self.domain_dir = ''
         if not self.p4.is_windows:
-            self.local_chinese_dir = self.get_chinese_dir(p4.to_local_path(p4path))
+            if self.p4.is_dir(p4path):
+                local_dir_path = p4.to_local_path(p4path)
+                self.domain_dir = self.get_chinese_dir(local_dir_path) or local_dir_path
+            else:
+                self.domain_dir = self.get_chinese_dir(p4.to_local_path(p4path))
 
     def __enter__(self):
         if self.local_chinese_dir:
