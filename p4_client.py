@@ -500,7 +500,7 @@ class P4Domain(object):
         self.p4path = p4path
         self.domain_dir = ''
         if not self.p4.is_windows:
-            if self.p4.is_dir(p4path):
+            if self.p4.does_dir_exist(p4path):
                 local_dir_path = p4.to_local_path(p4path)
                 self.domain_dir = self.get_chinese_dir(local_dir_path) or local_dir_path
             else:
