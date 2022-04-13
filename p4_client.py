@@ -12,10 +12,6 @@ class PathNotInClientViewError(P4Exception):
     pass
 
 
-class FindP4pathFailError(P4Exception):
-    pass
-
-
 class P4ClientOverwriteError(P4Exception):
     pass
 
@@ -441,10 +437,11 @@ class P4Client:
         p4_dir_paths = (self.__format_p4_dir(p4_dir_path, appendix='*') for p4_dir_path in p4_dir_paths)
         return self.run_dirs(*p4_dir_paths)
 
-    def files(self, p4_dir_path) -> list:
+    def files(self, p4_dir_path, **kwargs) -> list:
         """获取目录及其子目录下所有的文件信息列表"""
+        kwargs['encoding'] = 'gbk'
         p4_dir_path = self.__format_p4_dir(p4_dir_path)
-        return self.run_files('-e', p4_dir_path)
+        return self.run_files('-e', p4_dir_path, **kwargs)
 
     def submit(self, desc: str, *args, **kwargs):
         kwargs['encoding'] = 'gbk'
@@ -507,13 +504,13 @@ class P4Domain(object):
                 self.domain_dir = self.get_chinese_dir(p4.to_local_path(p4path))
 
     def __enter__(self):
-        if self.local_chinese_dir:
-            convmv_gbk_to_utf8(self.local_chinese_dir)
+        if self.domain_dir:
+            convmv_gbk_to_utf8(self.domain_dir)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if self.local_chinese_dir:
-            convmv_utf8_to_gbk(self.local_chinese_dir)
+        if self.domain_dir:
+            convmv_utf8_to_gbk(self.domain_dir)
 
     @staticmethod
     def get_chinese_dir(local_path) -> str:
@@ -548,65 +545,3 @@ def convmv_gbk_to_utf8(local_chinese_dir):
 def convmv_utf8_to_gbk(local_chinese_dir):
     os.system(f'convmv -t gbk -f utf-8 "{local_chinese_dir}"/* -r --notest --replace')
 
-
-def test():
-    # client_config = {
-    #     'Root': os.path.abspath(__file__ + '//..' * 5),
-    #     'Description': 'cdn图片上传',
-    #     'Host': ''
-    # }
-    print(p4_client.root)
-    import pdb
-    pdb.set_trace()
-    file_path = input('输入文件路径：')
-    print(file_path)
-    print(p4_client.to_p4_path(file_path))
-    # p4_client.add(file_path)
-    p4_client.overwrite(file_path)
-    p4_client.submit('test my overwrite interface')
-
-
-if __name__ == '__main__':
-    from pprint import pprint
-    from server.src.core.xlsxutils import load_data_from_excel
-    # p4_client = P4Client('chenaizhen', 'm8ywem', 'x5mobile-pipeline-service-test2', client_config={})
-    # p4_client = P4Client('dgm_auto', 'dgm!@!111', 'jenkins-effect-android-package', client_config={})
-    if os.name == 'nt':
-        p4_client = P4Client('dress_pm_cloth', '123', 'dress_collocation_debug', client_config={})
-    else:
-        p4_client = P4Client('dress_pm_cloth', '123', 'dress_collocation_linux_debug', client_config={})
-    # p4_client = P4Client('dgm_auto', 'dgm!@!111', 'jenkins-android-branch-texture-package', client_config={})
-    pprint(p4_client.get_view())
-    # pprint(p4_client.run_changes('-m 5', '-L','//x5_mobile/mr/art_release_test/art_src/campaign/dollarpurchase/...'))
-    # pprint(p4_client.run_describe('-I 1560750'))
-    # pprint(p4_client.run_describe('-s', '1559867'))
-    # pprint(p4_client.run_describe('-s', '1559921'))
-    # pprint(p4_client.run_describe('1559921'))
-    # pprint(p4_client.run_describe('21559921'))
-    # pprint(p4_client.describe_many('1559867', '1559921'))
-    # pprint(p4_client.describe_many('1559921', '1559867'))
-    # pprint(p4_client.run_changes('-m 10', '//project_dress/mr/Resources/art_src/texture/item_icon/...'))
-    item_name_p4_path = '//project_dress/dress_doc/文档管理/策划文档/版本投放表/【平台使用】投放途径对照表.xlsx'
-    item_name_local_path = p4_client.to_local_path(item_name_p4_path)
-    res = p4_client.sync('-f', item_name_p4_path)
-    # print(res)
-    with p4_client.domain(item_name_p4_path):
-        xlsx_data = load_data_from_excel(item_name_local_path, has_header=True)
-        sheet_data = xlsx_data[0]
-    print(sheet_data.headers)
-    import pdb
-    pdb.set_trace()
-    r = p4_client.describe('1559867')
-    pprint(r)
-    print('r:', type(r))
-    # try:
-    #     test()
-    # except P4Exception as err:
-    #     print(err)
-    #     print(err.__dict__)
-    #     print(err.__class__)
-    #     print(err.__class__.__name__)
-    #     print(type(err).__name__)
-    #     print(p4_client.errors)
-    #     import pdb
-    #     pdb.set_trace()
